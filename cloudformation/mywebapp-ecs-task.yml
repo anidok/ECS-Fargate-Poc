@@ -1,0 +1,263 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template to deploy ECS task'
+
+Parameters:
+  UserName:
+    Type: String
+    Default: 'Aniket'
+  Contact:
+    Description: Contact for stack owner(s).
+    Type: String
+    Default: 'aniket.dokania@datagrokr.com'
+    ConstraintDescription: Must be a valid email address
+  Project:
+    Description: Project code the resources should be associated with.
+    Type: String
+    Default: 'mywebapp'
+  BusinessUnit:
+    Type: String
+    Default: 'DataGrokr'
+  Environment:
+    Description: Environment the resources should be associated with.
+    Type: String
+    Default: 'dev'
+    AllowedValues: [ 'dev', 'int', 'uat', 'prod' ]
+  DockerImageTag:
+    Description: Image tag to pull from ECR
+    Type: String
+    Default: 'latest'
+  TaskDesiredCount:
+    Type: Number
+    Default: 1
+  TaskMinimumCount:
+    Type: Number
+    Default: 1
+  TaskMaximumCount:
+    Type: Number
+    Default: 6
+  TaskMemory:
+    Type: Number
+    Default: 512
+  TaskCpu:
+    Type: Number
+    Default: 256
+  AppRepoName:
+    Description: Repo name in ECR
+    Type: String
+    Default: 'mywebapp'
+  HighCpuThreshold:
+    Type: Number
+    Default: 25
+  LowCpuThreshold:
+    Type: Number
+    Default: 20
+  ALBInstall:
+    Type: String
+    Default: 'no'
+    AllowedValues: [ 'yes', 'no' ]
+  IsPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ ENABLED, DISABLED ]
+  SubnetIds:
+    Type: List<String>
+    Description: >
+      Specifies the Comma separated list of existing VPC Subnet
+      Ids where ECS tasks will run
+
+#############################################
+# Conditions
+#############################################
+
+Conditions:
+  IsALBNeeded: !Equals [!Ref ALBInstall, 'yes']
+
+
+Resources:
+
+#Create LogGroup for docker app
+
+  AppLog:
+   Type: AWS::Logs::LogGroup
+   Properties:
+     LogGroupName: !Sub ${Project}-${Environment}
+     RetentionInDays: 14
+
+# App docker container
+
+  AppTask:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - AppLog
+    Properties:
+      Family: !Ref Project
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !Ref "AWS::NoValue"  # Create a role to assign to task to access other AWS services
+      RequiresCompatibilities: 
+        - FARGATE
+      ContainerDefinitions:
+        - Name: !Ref Project
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppRepoName}:${DockerImageTag}'
+          Essential: true
+          LogConfiguration: # configures the logging driver
+            LogDriver: 'awslogs' # use logging driver awslogs to forward log messages to CloudWatch Logs
+            Options:
+              awslogs-region: !Ref 'AWS::Region' # the AWS region
+              awslogs-group:  !Sub ${Project}-${Environment}
+              awslogs-stream-prefix: !Ref Project
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Project}-ecsTaskExecutionRole-${AWS::Region}-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - AppTask
+    Properties:
+      Cluster:
+        Fn::ImportValue:
+          !Sub ${Project}-ECSCluster-${Environment}
+      DesiredCount: !Ref TaskDesiredCount
+      TaskDefinition: !Ref AppTask
+      LoadBalancers: !If 
+        - IsALBNeeded
+        - 
+          - ContainerName: !Ref Project
+            ContainerPort: 80
+            TargetGroupArn:
+              Fn::ImportValue:
+                !Sub ${Project}-ALBTargetGroupArn-${Environment}
+        - !Ref "AWS::NoValue"
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref IsPublicIp
+          SecurityGroups:
+          - Fn::ImportValue:
+              !Sub ${Project}-ECSSecurityGroup-${Environment}
+          Subnets: !Ref SubnetIds
+      LaunchType: FARGATE
+
+  ECSAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [application-autoscaling.amazonaws.com]
+          Action: ["sts:AssumeRole"]
+      Path: /
+      Policies:
+      - PolicyName: service-autoscaling
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ["application-autoscaling:*", "cloudwatch:DescribeAlarms", "cloudwatch:PutMetricAlarm",
+              "ecs:DescribeServices", "ecs:UpdateService"]
+            Resource: "*"
+
+  ECSTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref TaskMaximumCount
+      MinCapacity: !Ref TaskMinimumCount 
+      ResourceId: !Sub
+        - service/${ECSClusterName}/${ECSServiceName}
+        - ECSClusterName:
+            Fn::ImportValue:
+              !Sub "${Project}-ECSCluster-${Environment}"
+          ECSServiceName: !GetAtt Service.Name 
+      RoleARN: !GetAtt ECSAutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ECSClusterScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${Project}-ECSScaleOutPolicy-${Environment}
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ECSTarget
+      StepScalingPolicyConfiguration:
+        Cooldown: 60
+        MetricAggregationType: Average
+        AdjustmentType: ChangeInCapacity
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 2
+
+  ECSClusterCPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Project}-ECSClusterCPUAlarmHigh-${Environment}
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue:
+              !Sub "${Project}-ECSCluster-${Environment}"
+        - Name: ServiceName
+          Value: !GetAtt Service.Name
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: 'Average'
+      Threshold: !Ref HighCpuThreshold
+      AlarmActions:
+        - !Ref ECSClusterScaleOutPolicy
+
+  ECSClusterScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${Project}-ECSScaleInPolicy-${Environment}
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ECSTarget
+      StepScalingPolicyConfiguration:
+        Cooldown: 60
+        MetricAggregationType: Average
+        AdjustmentType: ChangeInCapacity
+        StepAdjustments:
+          - MetricIntervalUpperBound: -1
+            ScalingAdjustment: -2
+
+  ECSClusterCPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Project}-ECSClusterCPUAlarmLow-${Environment}
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue:
+              !Sub ${Project}-ECSCluster-${Environment}
+        - Name: ServiceName
+          Value: !GetAtt Service.Name
+      EvaluationPeriods: 1
+      Period: 60
+      Statistic: Average
+      Threshold: !Ref LowCpuThreshold
+      AlarmActions:
+        - !Ref ECSClusterScaleInPolicy
+
